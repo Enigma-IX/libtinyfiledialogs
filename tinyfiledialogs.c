@@ -98,13 +98,14 @@ misrepresented as being the original software.
 
 #ifdef _WIN32
  #ifndef _WIN32_WINNT
-  #define _WIN32_WINNT 0x0500
+  #define _WIN32_WINNT 0x0600 /* Vista+ required for IFileOpenDialog */
  #endif
  #ifndef TINYFD_NOLIB
   #include <windows.h>
   /*#define TINYFD_NOSELECTFOLDERWIN*/
   #ifndef TINYFD_NOSELECTFOLDERWIN
-	#include <shlobj.h>
+	#include <shlobj.h>      /* for SHCreateItemFromParsingName */
+	#include <shobjidl.h>    /* for IFileOpenDialog, FOS_PICKFOLDERS */
   #endif /*TINYFD_NOSELECTFOLDERWIN*/
  #endif
  #include <conio.h>
@@ -1445,67 +1446,90 @@ static char const * openFileDialogWinGui8(
 }
 
 #ifndef TINYFD_NOSELECTFOLDERWIN
-static int __stdcall BrowseCallbackProc(HWND hwnd, UINT uMsg, LPARAM lp, LPARAM pData)
-{
-	if (uMsg == BFFM_INITIALIZED)
-	{
-		SendMessage(hwnd, BFFM_SETSELECTION, TRUE, pData);
-	}
-	return 0;
-}
-
-static int __stdcall BrowseCallbackProcW(HWND hwnd, UINT uMsg, LPARAM lp, LPARAM pData)
-{
-	if (uMsg == BFFM_INITIALIZED)
-	{
-		SendMessage(hwnd, BFFM_SETSELECTIONW, TRUE, (LPARAM)pData);
-	}
-	return 0;
-}
-
 wchar_t const * tinyfd_selectFolderDialogW(
 	wchar_t const * const aTitle, /*  NULL or "" */
 	wchar_t const * const aDefaultPath) /* NULL or "" */
 {
 	static wchar_t lBuff[MAX_PATH_OR_CMD];
 
-	BROWSEINFOW bInfo;
-	LPITEMIDLIST lpItem;
+	IFileOpenDialog * pfd = NULL;
+	IShellItem * psi = NULL;
+	IShellItem * psiDefault = NULL;
+	LPWSTR lRetPath = NULL;
 	HRESULT lHResult;
+	HRESULT lCoInit;
+	FILEOPENDIALOGOPTIONS lOpts;
 
-	lHResult = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	lCoInit = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
-	bInfo.hwndOwner = 0;
-	bInfo.pidlRoot = NULL;
-	bInfo.pszDisplayName = lBuff;
-	bInfo.lpszTitle = aTitle && wcslen(aTitle) ? aTitle : NULL;
-	if (lHResult == S_OK || lHResult == S_FALSE)
+	lHResult = CoCreateInstance(
+		&CLSID_FileOpenDialog, NULL,
+		CLSCTX_ALL,
+		&IID_IFileOpenDialog,
+		(void **)&pfd);
+
+	if (FAILED(lHResult))
 	{
-		bInfo.ulFlags = BIF_USENEWUI;
-	}
-	bInfo.lpfn = BrowseCallbackProcW;
-	bInfo.lParam = (LPARAM)aDefaultPath;
-	bInfo.iImage = -1;
-
-	lpItem = SHBrowseForFolderW(&bInfo);
-	if (lpItem)
-	{
-		SHGetPathFromIDListW(lpItem, lBuff);
+		goto cleanup;
 	}
 
-	if (lHResult == S_OK || lHResult == S_FALSE)
+	/* Set folder-picker mode: no file selection allowed */
+	pfd->lpVtbl->GetOptions(pfd, &lOpts);
+	pfd->lpVtbl->SetOptions(pfd, lOpts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+
+	/* Optional title */
+	if (aTitle && wcslen(aTitle))
+	{
+		pfd->lpVtbl->SetTitle(pfd, aTitle);
+	}
+
+	/* Optional default folder */
+	if (aDefaultPath && wcslen(aDefaultPath))
+	{
+		if (SUCCEEDED(SHCreateItemFromParsingName(
+				aDefaultPath, NULL,
+				&IID_IShellItem,
+				(void **)&psiDefault)))
+		{
+			pfd->lpVtbl->SetFolder(pfd, psiDefault);
+			psiDefault->lpVtbl->Release(psiDefault);
+		}
+	}
+
+	lHResult = pfd->lpVtbl->Show(pfd, NULL);
+	if (FAILED(lHResult))
+	{
+		goto cleanup;
+	}
+
+	lHResult = pfd->lpVtbl->GetResult(pfd, &psi);
+	if (FAILED(lHResult))
+	{
+		goto cleanup;
+	}
+
+	lHResult = psi->lpVtbl->GetDisplayName(psi, SIGDN_FILESYSPATH, &lRetPath);
+	if (SUCCEEDED(lHResult) && lRetPath)
+	{
+		wcsncpy(lBuff, lRetPath, MAX_PATH_OR_CMD - 1);
+		lBuff[MAX_PATH_OR_CMD - 1] = L'\0';
+		CoTaskMemFree(lRetPath);
+		lRetPath = lBuff; /* reuse pointer as success flag */
+	}
+	else
+	{
+		lRetPath = NULL;
+	}
+
+cleanup:
+	if (psi)   psi->lpVtbl->Release(psi);
+	if (pfd)   pfd->lpVtbl->Release(pfd);
+	if (lCoInit == S_OK || lCoInit == S_FALSE)
 	{
 		CoUninitialize();
 	}
 
-	if (lpItem)
-	{
-		return lBuff;
-	}
-	else
-	{
-		return NULL;
-	}
+	return lRetPath ? lBuff : NULL;
 }
 
 
@@ -1945,36 +1969,31 @@ static char const * selectFolderDialogWinGuiA (
 	char const * const aTitle , /*  NULL or "" */
 	char const * const aDefaultPath ) /* NULL or "" */
 {
-	BROWSEINFOA bInfo ;
-	LPITEMIDLIST lpItem ;
-	HRESULT lHResult;
+	/* Delegate to the Unicode (W) implementation which uses the modern
+	   IFileOpenDialog + FOS_PICKFOLDERS API (Vista+). */
+	wchar_t * lTitle;
+	wchar_t * lDefaultPath;
+	wchar_t const * lTmpWChar;
+	char * lTmpChar;
 
-	lHResult = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	lTitle = utf8to16(aTitle ? aTitle : "");
+	lDefaultPath = utf8to16(aDefaultPath ? aDefaultPath : "");
 
-	/* we can't use aDefaultPath */
-	bInfo.hwndOwner = 0 ;
-	bInfo.pidlRoot = NULL ;
-	bInfo.pszDisplayName = aoBuff ;
-	bInfo.lpszTitle = aTitle && strlen(aTitle) ? aTitle : NULL;
-	if (lHResult == S_OK || lHResult == S_FALSE)
+	lTmpWChar = tinyfd_selectFolderDialogW(lTitle, lDefaultPath);
+
+	free(lTitle);
+	free(lDefaultPath);
+
+	if (!lTmpWChar)
 	{
-		bInfo.ulFlags = BIF_USENEWUI;
-	}
-	bInfo.lpfn = BrowseCallbackProc;
-	bInfo.lParam = (LPARAM)aDefaultPath;
-	bInfo.iImage = -1 ;
-
-	lpItem = SHBrowseForFolderA ( & bInfo ) ;
-	if ( lpItem )
-	{
-		SHGetPathFromIDListA ( lpItem , aoBuff ) ;
+		return NULL;
 	}
 
-	if (lHResult==S_OK || lHResult==S_FALSE)
-	{
-		CoUninitialize();
-	}
-	return aoBuff ;
+	lTmpChar = utf16to8(lTmpWChar);
+	strcpy(aoBuff, lTmpChar);
+	free(lTmpChar);
+
+	return aoBuff;
 }
 #endif /*TINYFD_NOSELECTFOLDERWIN*/
 
